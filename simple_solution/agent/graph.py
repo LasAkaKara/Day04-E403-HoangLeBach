@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import tool
 
@@ -110,12 +111,21 @@ def build_agent(
     data_dir: Path | None = None,
     output_dir: Path | None = None,
     *,
-    provider: str = "google",
+    provider: str = "mistral",
     model_name: str | None = None,
     today: str | None = None,
 ):
     store = OrderDataStore(data_dir or DEFAULT_DATA_DIR, output_dir or DEFAULT_OUTPUT_DIR, today=today)
-    model = build_chat_model(provider=provider, model_name=model_name, temperature=0.0)
+    if provider == "mistral":
+        import os
+        from langchain_mistralai import ChatMistralAI
+        model = ChatMistralAI(
+            model=model_name or os.getenv("MISTRAL_MODEL", "mistral-large-latest"),
+            temperature=0.0,
+            mistral_api_key=os.getenv("MISTRAL_API_KEY"),
+        )
+    else:
+        model = build_chat_model(provider=provider, model_name=model_name, temperature=0.0)
     return create_agent(
         model=model,
         tools=build_tools(store),
@@ -123,10 +133,35 @@ def build_agent(
     )
 
 
+class TokenLogHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.request_count = 0
+        self.total_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        self.request_count += 1
+        try:
+            usage = {}
+            if response.llm_output and "token_usage" in response.llm_output:
+                usage = response.llm_output["token_usage"]
+            else:
+                gen = response.generations[0][0]
+                if hasattr(gen, "message") and hasattr(gen.message, "response_metadata"):
+                    usage = gen.message.response_metadata.get("token_usage", {})
+            if usage:
+                prompt = usage.get("prompt_tokens", 0)
+                comp = usage.get("completion_tokens", 0)
+                total = usage.get("total_tokens", 0)
+                self.total_tokens += total
+                print(f"\n[LLM Req #{self.request_count}] Tokens: {total} (Prompt: {prompt}, Comp: {comp}) | Total this Case: {self.total_tokens}\n")
+        except Exception:
+            pass
+
+
 def run_agent(
     query: str,
     *,
-    provider: str = "google",
+    provider: str = "mistral",
     model_name: str | None = None,
     data_dir: Path | None = None,
     output_dir: Path | None = None,
@@ -139,7 +174,10 @@ def run_agent(
         model_name=model_name,
         today=today,
     )
-    response = agent.invoke({"messages": [{"role": "user", "content": query}]})
+    response = agent.invoke(
+        {"messages": [{"role": "user", "content": query}]},
+        config={"callbacks": [TokenLogHandler()]},
+    )
     messages = response["messages"] if isinstance(response, dict) else response
     tool_calls = extract_tool_calls(messages)
     saved_order, saved_order_path = extract_saved_order(tool_calls)
